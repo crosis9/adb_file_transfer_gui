@@ -1,0 +1,9 @@
+ここに Google公式 Windows版 Platform-Tools の以下ファイルを配置してください。
+
+- adb.exe
+- AdbWinApi.dll
+- AdbWinUsbApi.dll
+
+注意:
+このリポジトリにはADB本体は含めません。
+Google公式の Platform-Tools を取得して配置してください。

@@ -1,0 +1,31 @@
+# 必要になったらファイル名を build.yml に変更して使ってください。
+# GitHub Actions上でWindows exeをビルドするサンプルです。
+# 注意:
+#   platform-tools の adb.exe / DLL はリポジトリに含めない方針のため、
+#   このままでは --add-binary 指定ありの build_exe.bat は使いません。
+#   Actions上でexeを自動ビルドしたい場合は、ビルド時にPlatform-Toolsを取得する処理を追加してください。
+
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build without bundled adb
+        run: |
+          pyinstaller --noconsole --onefile --name AdbFileTransfer adb_gui.py

@@ -1,0 +1,28 @@
+.venv/
+venv/
+env/
+
+__pycache__/
+*.py[cod]
+*.pyo
+
+build/
+dist/
+*.spec
+
+# Local Android Platform-Tools binaries
+platform-tools/adb.exe
+platform-tools/AdbWinApi.dll
+platform-tools/AdbWinUsbApi.dll
+platform-tools/fastboot.exe
+platform-tools/*.dll
+platform-tools/*.exe
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
