@@ -1,20 +1,39 @@
+import json
 import os
 import re
-import string
 import subprocess
 import sys
 import threading
+import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import ttk, filedialog, messagebox
 
 
-APP_VERSION = "0.2.2"
-APP_TITLE = f"ADB File Transfer GUI v{APP_VERSION} | kuroha"
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    DND_AVAILABLE = True
+    BaseTk = TkinterDnD.Tk
+except Exception:
+    DND_FILES = None
+    DND_AVAILABLE = False
+    BaseTk = tk.Tk
+
+
+APP_VERSION = "0.3.2"
+APP_TITLE = f"ADB Command Builder v{APP_VERSION} | kuroha"
 
 CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+@dataclass
+class AndroidEntry:
+    name: str
+    path: str
+    is_dir: bool
 
 
 def app_base_dir() -> Path:
@@ -34,15 +53,22 @@ def default_adb_path() -> str:
     return "adb"
 
 
-def quote_shell_path(path: str) -> str:
-    """
-    Android shell向けのシンプルなシングルクォートエスケープ。
-    """
-    return "'" + path.replace("'", "'\"'\"'") + "'"
+def config_dir() -> Path:
+    if os.name == "nt":
+        root = os.environ.get("APPDATA")
+        if root:
+            return Path(root) / "AdbCommandBuilder"
+    return Path.home() / ".adb_command_builder"
 
 
-def normalize_android_dir(path: str) -> str:
-    path = path.strip() or "/sdcard/"
+def config_path() -> Path:
+    return config_dir() / "settings.json"
+
+
+def normalize_remote_dir(path: str) -> str:
+    path = (path or "").strip()
+    if not path:
+        path = "/sdcard/Download/"
     if not path.startswith("/"):
         path = "/" + path
     if not path.endswith("/"):
@@ -50,820 +76,961 @@ def normalize_android_dir(path: str) -> str:
     return path
 
 
-def format_bytes(size: int | None) -> str:
-    if size is None or size < 0:
-        return ""
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(size)
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(value)} {unit}"
-            return f"{value:.1f} {unit}"
-        value /= 1024
-    return f"{size} B"
+def ps_single_quote(value: str) -> str:
+    """
+    PowerShell single-quoted literal.
+    ' は '' にする。
+    """
+    return "'" + value.replace("'", "''") + "'"
 
 
-def format_datetime_from_timestamp(timestamp: float | int | None) -> str:
-    if timestamp is None:
-        return ""
-    try:
-        return datetime.fromtimestamp(float(timestamp)).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return ""
+def quote_android_shell_path(path: str) -> str:
+    """
+    Android shell用の単純なsingle quote。
+    ' は '\'' にする。
+    """
+    return "'" + path.replace("'", "'\\''") + "'"
 
 
-@dataclass
-class AndroidItem:
-    name: str
-    path: str
-    is_dir: bool
-    size: int | None = None
-    modified: str = ""
+def sanitize_windows_filename(name: str, fallback: str = "adb_push") -> str:
+    name = unicodedata.normalize("NFKC", name)
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    name = re.sub(r"\s+", " ", name).strip(" ._")
+    if not name:
+        name = fallback
+    return name[:120]
 
 
-class AdbFileTransferGui(tk.Tk):
-    PROGRESS_RE = re.compile(r"(?<!\d)(\d{1,3})\s*%")
+def make_safe_temp_filename(filename: str, index: int) -> str:
+    """
+    ADB push時のリモート一時名。
+    非ASCIIやshell上で面倒な文字は _ に寄せる。
+    最終名は mv で元名へ戻す。
+    """
+    p = Path(filename)
+    suffix = p.suffix
+    stem_source = p.stem or "file"
 
+    name = unicodedata.normalize("NFKC", stem_source)
+    chars = []
+    for ch in name:
+        if ch.isascii() and (ch.isalnum() or ch in "._-"):
+            chars.append(ch)
+        else:
+            chars.append("_")
+
+    stem = "".join(chars)
+    stem = re.sub(r"_+", "_", stem).strip("._-")
+
+    if not stem:
+        stem = "file"
+
+    return f"{stem}.adbtmp-{int(time.time())}-{index}{suffix}"
+
+
+def remote_join(remote_dir: str, filename: str) -> str:
+    return normalize_remote_dir(remote_dir) + filename
+
+
+class AdbCommandBuilder(BaseTk):
     def __init__(self):
         super().__init__()
 
         self.title(APP_TITLE)
-        self.geometry("1280x760")
-        self.minsize(1080, 660)
+        self.geometry("1120x860")
+        self.minsize(980, 740)
 
         self.adb_path = tk.StringVar(value=default_adb_path())
         self.selected_device = tk.StringVar()
+        self.remote_dir = tk.StringVar(value="/sdcard/Download/")
+        self.browser_current_dir = tk.StringVar(value="/sdcard/Download/")
+        self.command_status = tk.StringVar(value="未生成")
+        self.browser_status = tk.StringVar(value="Android側ファイラー: 未読込")
+        self.preserve_filename = tk.BooleanVar(value=True)
+        self.stop_on_error = tk.BooleanVar(value=False)
 
-        self.local_current_path = tk.StringVar(value=str(Path.home()))
-        self.local_selected_path = tk.StringVar(value="")
-
-        self.android_current_path = tk.StringVar(value="/sdcard/")
-        self.android_selected_path = tk.StringVar(value="")
-        self.selected_storage = tk.StringVar()
-        self.android_roots: dict[str, str] = {}
-
-        self.progress_var = tk.DoubleVar(value=0)
-        self.progress_text = tk.StringVar(value="待機中")
-        self.progress_mode_known = False
-        self.running = False
+        self.local_files: list[str] = []
+        self.remote_history: list[str] = []
         self.android_loading = False
 
-        self._build_ui()
-        self.refresh_devices()
-        self.load_local_dir(Path(self.local_current_path.get()))
+        self.load_settings()
+        self.build_ui()
+        self.refresh_file_list()
+        self.generate_command()
+
+    # -----------------------------
+    # Settings
+    # -----------------------------
+    def load_settings(self):
+        try:
+            path = config_path()
+            if not path.exists():
+                return
+
+            data = json.loads(path.read_text(encoding="utf-8"))
+
+            if isinstance(data.get("adb_path"), str) and data["adb_path"]:
+                self.adb_path.set(data["adb_path"])
+
+            if isinstance(data.get("remote_dir"), str) and data["remote_dir"]:
+                remote = normalize_remote_dir(data["remote_dir"])
+                self.remote_dir.set(remote)
+                self.browser_current_dir.set(remote)
+
+            if isinstance(data.get("remote_history"), list):
+                self.remote_history = [
+                    normalize_remote_dir(str(x)) for x in data["remote_history"]
+                    if isinstance(x, str) and x.strip()
+                ][:20]
+
+        except Exception:
+            pass
+
+    def save_settings(self):
+        try:
+            config_dir().mkdir(parents=True, exist_ok=True)
+
+            data = {
+                "adb_path": self.adb_path.get(),
+                "remote_dir": normalize_remote_dir(self.remote_dir.get()),
+                "remote_history": self.remote_history[:20],
+            }
+
+            config_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     # -----------------------------
     # UI
     # -----------------------------
-    def _build_ui(self):
+    def build_ui(self):
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
 
-        top = ttk.LabelFrame(root, text="ADB / Device", padding=10)
-        top.pack(fill="x")
+        self.build_adb_frame(root)
 
-        ttk.Label(top, text="ADB:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.adb_path).grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(top, text="adb.exe参照", command=self.browse_adb).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(top, text="端末再検出", command=self.refresh_devices).grid(row=0, column=3)
+        middle = ttk.PanedWindow(root, orient="horizontal")
+        middle.pack(fill="both", expand=True, pady=(10, 0))
 
-        ttk.Label(top, text="Device:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.device_combo = ttk.Combobox(top, textvariable=self.selected_device, state="readonly")
+        left = ttk.Frame(middle)
+        right = ttk.Frame(middle)
+
+        middle.add(left, weight=1)
+        middle.add(right, weight=1)
+
+        self.build_files_frame(left)
+        self.build_remote_frame(right)
+        self.build_android_browser_frame(right)
+
+        self.build_options_frame(root)
+        self.build_command_frame(root)
+
+    def build_adb_frame(self, root):
+        frame = ttk.LabelFrame(root, text="ADB / Device", padding=10)
+        frame.pack(fill="x")
+
+        ttk.Label(frame, text="ADB:").grid(row=0, column=0, sticky="w")
+
+        adb_entry = ttk.Entry(frame, textvariable=self.adb_path)
+        adb_entry.grid(row=0, column=1, sticky="ew", padx=8)
+        adb_entry.bind("<KeyRelease>", lambda _e: self.on_input_changed())
+
+        ttk.Button(frame, text="adb.exe参照", command=self.browse_adb).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(frame, text="端末検出", command=self.detect_devices).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(frame, text="ADB接続キャッシュクリア", command=self.clear_device_connection_cache).grid(row=0, column=4)
+
+        ttk.Label(frame, text="Device:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        self.device_combo = ttk.Combobox(frame, textvariable=self.selected_device)
         self.device_combo.grid(row=1, column=1, sticky="ew", padx=8, pady=(8, 0))
-        self.device_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_device_changed())
+        self.device_combo.bind("<<ComboboxSelected>>", lambda _e: self.generate_command())
+        self.device_combo.bind("<KeyRelease>", lambda _e: self.generate_command())
 
-        ttk.Label(top, text="Storage:").grid(row=1, column=2, sticky="e", pady=(8, 0))
-        self.storage_combo = ttk.Combobox(top, textvariable=self.selected_storage, state="readonly")
-        self.storage_combo.grid(row=1, column=3, sticky="ew", pady=(8, 0))
-        self.storage_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_storage_changed())
+        ttk.Label(frame, text="複数端末接続時はDeviceを選択。空欄なら -s なしで生成します。").grid(
+            row=1, column=2, columnspan=3, sticky="w", pady=(8, 0)
+        )
 
-        top.columnconfigure(1, weight=1)
-        top.columnconfigure(3, weight=1)
+        frame.columnconfigure(1, weight=1)
 
-        # Path bar
-        path_frame = ttk.Frame(root)
-        path_frame.pack(fill="x", pady=(10, 0))
+    def build_files_frame(self, root):
+        frame = ttk.LabelFrame(root, text="転送元ファイル", padding=10)
+        frame.pack(fill="both", expand=True)
 
-        local_path_frame = ttk.LabelFrame(path_frame, text="Windows", padding=8)
-        local_path_frame.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.drop_label = ttk.Label(
+            frame,
+            text="ここにファイルをドラッグ&ドロップ、または [ファイル追加] から複数選択",
+            anchor="center",
+            relief="ridge",
+            padding=14
+        )
+        self.drop_label.pack(fill="x")
 
-        ttk.Label(local_path_frame, text="現在:").grid(row=0, column=0, sticky="w")
-        local_entry = ttk.Entry(local_path_frame, textvariable=self.local_current_path)
-        local_entry.grid(row=0, column=1, sticky="ew", padx=6)
-        local_entry.bind("<Return>", lambda _e: self.load_local_dir(Path(self.local_current_path.get())))
-        ttk.Button(local_path_frame, text="移動", command=lambda: self.load_local_dir(Path(self.local_current_path.get()))).grid(row=0, column=2)
-        ttk.Button(local_path_frame, text="デスクトップ", command=self.goto_desktop).grid(row=0, column=3, padx=(6, 0))
-        ttk.Button(local_path_frame, text="ダウンロード", command=self.goto_downloads).grid(row=0, column=4, padx=(6, 0))
+        if DND_AVAILABLE:
+            self.drop_label.drop_target_register(DND_FILES)
+            self.drop_label.dnd_bind("<<Drop>>", self.on_drop_files)
+        else:
+            self.drop_label.configure(
+                text="D&Dは無効です。tkinterdnd2 が利用できません。[ファイル追加] を使用してください。"
+            )
 
-        ttk.Label(local_path_frame, text="選択:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(local_path_frame, textvariable=self.local_selected_path, state="readonly").grid(row=1, column=1, columnspan=4, sticky="ew", padx=6, pady=(6, 0))
-        local_path_frame.columnconfigure(1, weight=1)
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="both", expand=True, pady=(8, 0))
 
-        android_path_frame = ttk.LabelFrame(path_frame, text="Android", padding=8)
-        android_path_frame.pack(side="right", fill="x", expand=True, padx=(5, 0))
+        self.file_listbox = tk.Listbox(list_frame, height=14, selectmode="extended")
+        self.file_listbox.pack(side="left", fill="both", expand=True)
 
-        ttk.Label(android_path_frame, text="現在:").grid(row=0, column=0, sticky="w")
-        android_entry = ttk.Entry(android_path_frame, textvariable=self.android_current_path)
-        android_entry.grid(row=0, column=1, sticky="ew", padx=6)
-        android_entry.bind("<Return>", lambda _e: self.load_android_dir(self.android_current_path.get()))
-        ttk.Button(android_path_frame, text="移動", command=lambda: self.load_android_dir(self.android_current_path.get())).grid(row=0, column=2)
+        yscroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.file_listbox.yview)
+        yscroll.pack(side="right", fill="y")
+        self.file_listbox.configure(yscrollcommand=yscroll.set)
 
-        ttk.Label(android_path_frame, text="選択:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(android_path_frame, textvariable=self.android_selected_path, state="readonly").grid(row=1, column=1, columnspan=2, sticky="ew", padx=6, pady=(6, 0))
-        android_path_frame.columnconfigure(1, weight=1)
+        if DND_AVAILABLE:
+            self.file_listbox.drop_target_register(DND_FILES)
+            self.file_listbox.dnd_bind("<<Drop>>", self.on_drop_files)
 
-        # Explorer panes
-        panes = ttk.PanedWindow(root, orient="horizontal")
-        panes.pack(fill="both", expand=True, pady=(10, 0))
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x", pady=(8, 0))
 
-        left = ttk.Frame(panes)
-        right = ttk.Frame(panes)
-        panes.add(left, weight=1)
-        panes.add(right, weight=1)
+        ttk.Button(btns, text="ファイル追加", command=self.browse_files).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="選択削除", command=self.remove_selected_files).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="全クリア", command=self.clear_files).pack(side="left", padx=(0, 8))
 
-        self.local_tree = self._create_tree(left)
-        self.android_tree = self._create_tree(right)
+    def build_remote_frame(self, root):
+        frame = ttk.LabelFrame(root, text="Android側保存先ディレクトリ", padding=10)
+        frame.pack(fill="x")
 
-        self.local_tree.bind("<<TreeviewSelect>>", self.on_local_select)
-        self.local_tree.bind("<Double-1>", self.on_local_double_click)
+        ttk.Label(frame, text="Remote Dir:").grid(row=0, column=0, sticky="w")
+
+        self.remote_combo = ttk.Combobox(frame, textvariable=self.remote_dir, values=self.remote_history)
+        self.remote_combo.grid(row=0, column=1, sticky="ew", padx=8)
+        self.remote_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_remote_changed())
+        self.remote_combo.bind("<KeyRelease>", lambda _e: self.on_remote_key_changed())
+
+        ttk.Button(frame, text="履歴保存", command=self.save_current_remote).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(frame, text="履歴クリア", command=self.clear_remote_history).grid(row=0, column=3)
+
+        presets = ttk.Frame(frame)
+        presets.grid(row=1, column=1, columnspan=3, sticky="w", pady=(8, 0))
+
+        preset_values = [
+            "/sdcard/Download/",
+            "/sdcard/ROMs/",
+            "/storage/emulated/0/Download/",
+            "/storage/emulated/0/ROMs/",
+        ]
+
+        for value in preset_values:
+            ttk.Button(
+                presets,
+                text=value,
+                command=lambda v=value: self.set_remote_dir(v, save=False)
+            ).pack(side="left", padx=(0, 6))
+
+        frame.columnconfigure(1, weight=1)
+
+    def build_android_browser_frame(self, root):
+        frame = ttk.LabelFrame(root, text="Android側ファイラー（軽量表示）", padding=10)
+        frame.pack(fill="both", expand=True, pady=(10, 0))
+
+        path_frame = ttk.Frame(frame)
+        path_frame.pack(fill="x")
+
+        ttk.Label(path_frame, text="現在:").pack(side="left")
+        path_entry = ttk.Entry(path_frame, textvariable=self.browser_current_dir)
+        path_entry.pack(side="left", fill="x", expand=True, padx=8)
+        path_entry.bind("<Return>", lambda _e: self.load_android_dir(self.browser_current_dir.get()))
+
+        ttk.Button(path_frame, text="開く", command=lambda: self.load_android_dir(self.browser_current_dir.get())).pack(side="left", padx=(0, 6))
+        ttk.Button(path_frame, text="親へ", command=self.open_android_parent).pack(side="left", padx=(0, 6))
+
+        browser_buttons = ttk.Frame(frame)
+        browser_buttons.pack(fill="x", pady=(8, 0))
+
+        ttk.Button(browser_buttons, text="ストレージ候補検出", command=self.detect_storage_roots).pack(side="left", padx=(0, 6))
+        ttk.Button(browser_buttons, text="現在の場所を保存先に設定", command=self.use_browser_dir_as_remote).pack(side="left", padx=(0, 6))
+        ttk.Button(browser_buttons, text="選択フォルダを保存先に設定", command=self.use_selected_android_dir_as_remote).pack(side="left", padx=(0, 6))
+
+        self.android_tree = ttk.Treeview(
+            frame,
+            columns=("path", "kind"),
+            show="tree headings",
+            selectmode="browse",
+            height=10
+        )
+        self.android_tree.heading("#0", text="名前")
+        self.android_tree.heading("path", text="パス")
+        self.android_tree.heading("kind", text="種別")
+
+        self.android_tree.column("#0", width=220, stretch=True)
+        self.android_tree.column("path", width=320, stretch=True)
+        self.android_tree.column("kind", width=60, stretch=False)
+
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=self.android_tree.yview)
+        self.android_tree.configure(yscrollcommand=yscroll.set)
+
+        self.android_tree.pack(side="left", fill="both", expand=True, pady=(8, 0))
+        yscroll.pack(side="right", fill="y", pady=(8, 0))
 
         self.android_tree.bind("<<TreeviewSelect>>", self.on_android_select)
         self.android_tree.bind("<Double-1>", self.on_android_double_click)
 
-        # Transfer controls
-        controls = ttk.LabelFrame(root, text="Transfer / 操作", padding=10)
-        controls.pack(fill="x", pady=(10, 0))
+        ttk.Label(frame, textvariable=self.browser_status).pack(anchor="w", pady=(8, 0))
 
-        ttk.Button(controls, text="→ Push  WindowsからAndroidへ", command=self.push_selected).pack(side="left", padx=(0, 8))
-        ttk.Button(controls, text="← Pull  AndroidからWindowsへ", command=self.pull_selected).pack(side="left", padx=(0, 8))
-        ttk.Button(controls, text="Windows側に新しいフォルダ", command=self.create_local_folder).pack(side="left", padx=(0, 8))
-        ttk.Button(controls, text="Android側に新しいフォルダ", command=self.create_android_folder).pack(side="left", padx=(0, 8))
-        ttk.Button(controls, text="Android側更新", command=lambda: self.load_android_dir(self.android_current_path.get())).pack(side="left", padx=(0, 8))
-        ttk.Button(controls, text="Windows側更新", command=lambda: self.load_local_dir(Path(self.local_current_path.get()))).pack(side="left", padx=(0, 8))
-        ttk.Button(controls, text="ADB再起動", command=self.restart_adb).pack(side="right")
+    def build_options_frame(self, root):
+        frame = ttk.LabelFrame(root, text="生成オプション", padding=10)
+        frame.pack(fill="x", pady=(10, 0))
 
-        # Progress
-        progress = ttk.LabelFrame(root, text="転送進捗", padding=10)
-        progress.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(
+            frame,
+            text="非ASCIIファイル名は一時ASCII名でpush後、Android側で元の日本語名へmvする",
+            variable=self.preserve_filename,
+            command=self.generate_command
+        ).pack(anchor="w")
 
-        self.progress_bar = ttk.Progressbar(progress, variable=self.progress_var, maximum=100, mode="determinate")
-        self.progress_bar.pack(fill="x")
-        ttk.Label(progress, textvariable=self.progress_text).pack(anchor="w", pady=(6, 0))
+        ttk.Checkbutton(
+            frame,
+            text="エラー発生時にそこで停止する",
+            variable=self.stop_on_error,
+            command=self.generate_command
+        ).pack(anchor="w", pady=(4, 0))
 
-        # Log
-        log_frame = ttk.LabelFrame(root, text="ログ", padding=10)
-        log_frame.pack(fill="both", expand=False, pady=(10, 0))
+    def build_command_frame(self, root):
+        frame = ttk.LabelFrame(root, text="生成PowerShellコマンド", padding=10)
+        frame.pack(fill="both", expand=True, pady=(10, 0))
 
-        self.log = tk.Text(log_frame, height=9, wrap="word")
-        self.log.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
-        scroll.pack(side="right", fill="y")
-        self.log.configure(yscrollcommand=scroll.set)
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
 
-    def _create_tree(self, parent: ttk.Frame) -> ttk.Treeview:
-        tree = ttk.Treeview(
-            parent,
-            columns=("path", "kind", "modified", "size"),
-            show="tree headings",
-            selectmode="browse"
-        )
-        tree.heading("#0", text="名前")
-        tree.heading("path", text="パス")
-        tree.heading("kind", text="種別")
-        tree.heading("modified", text="更新日時")
-        tree.heading("size", text="容量")
-        tree.column("#0", width=220, stretch=True)
-        tree.column("path", width=360, stretch=True)
-        tree.column("kind", width=70, stretch=False)
-        tree.column("modified", width=150, stretch=False)
-        tree.column("size", width=95, stretch=False, anchor="e")
+        ttk.Button(btns, text="コマンド生成", command=self.generate_command).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="クリップボードへコピー", command=self.copy_command).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text=".ps1として保存", command=self.save_ps1).pack(side="left", padx=(0, 8))
 
-        yscroll = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
-        xscroll = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        ttk.Label(btns, textvariable=self.command_status).pack(side="left", padx=(12, 0))
 
-        tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
-        parent.rowconfigure(0, weight=1)
-        parent.columnconfigure(0, weight=1)
-        return tree
+        self.command_text = tk.Text(frame, height=15, wrap="none")
+        self.command_text.pack(fill="both", expand=True, pady=(8, 0))
 
-    def log_write(self, text: str):
-        self.log.insert("end", text)
-        self.log.see("end")
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=self.command_text.yview)
+        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=self.command_text.xview)
+        self.command_text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        yscroll.pack(side="right", fill="y")
+        xscroll.pack(side="bottom", fill="x")
 
     # -----------------------------
-    # ADB helpers
+    # File handling
+    # -----------------------------
+    def on_drop_files(self, event):
+        try:
+            paths = self.tk.splitlist(event.data)
+        except Exception:
+            paths = [event.data]
+
+        self.add_files(paths)
+
+    def browse_files(self):
+        paths = filedialog.askopenfilenames(
+            title="転送するファイルを選択",
+            filetypes=[
+                ("All files", "*.*"),
+                ("ISO files", "*.iso"),
+                ("Compressed files", "*.zip *.7z *.rar"),
+                ("ROM files", "*.iso *.bin *.cue *.chd *.zip *.7z"),
+            ]
+        )
+        self.add_files(paths)
+
+    def add_files(self, paths):
+        added = 0
+        skipped = []
+
+        for raw in paths:
+            raw = str(raw).strip()
+            if not raw:
+                continue
+
+            p = Path(raw)
+
+            if not p.exists():
+                skipped.append(f"存在しない: {raw}")
+                continue
+
+            if not p.is_file():
+                skipped.append(f"ファイルではない: {raw}")
+                continue
+
+            normalized = str(p)
+
+            if normalized not in self.local_files:
+                self.local_files.append(normalized)
+                added += 1
+
+        self.refresh_file_list()
+        self.generate_command()
+
+        if skipped:
+            messagebox.showwarning(
+                "一部スキップ",
+                "\n".join(skipped[:10]) + ("\n..." if len(skipped) > 10 else "")
+            )
+
+        if added:
+            self.save_settings()
+
+    def refresh_file_list(self):
+        self.file_listbox.delete(0, "end")
+        for path in self.local_files:
+            self.file_listbox.insert("end", path)
+
+    def remove_selected_files(self):
+        selected = list(self.file_listbox.curselection())
+        if not selected:
+            return
+
+        for idx in reversed(selected):
+            del self.local_files[idx]
+
+        self.refresh_file_list()
+        self.generate_command()
+
+    def clear_files(self):
+        self.local_files.clear()
+        self.refresh_file_list()
+        self.generate_command()
+
+    # -----------------------------
+    # ADB / device
     # -----------------------------
     def browse_adb(self):
         path = filedialog.askopenfilename(
             title="adb.exeを選択",
-            filetypes=[("adb.exe", "adb.exe"), ("Executable", "*.exe"), ("All files", "*.*")]
+            filetypes=[
+                ("adb.exe", "adb.exe"),
+                ("Executable", "*.exe"),
+                ("All files", "*.*"),
+            ]
         )
+
         if path:
             self.adb_path.set(path)
+            self.save_settings()
+            self.generate_command()
 
-    def selected_serial(self) -> str | None:
-        value = self.selected_device.get().strip()
-        if not value:
-            return None
-        return value.split()[0]
+    def on_input_changed(self):
+        self.save_settings()
+        self.generate_command()
 
-    def adb_cmd(self, args: list[str], require_device: bool = True) -> list[str]:
-        base = [self.adb_path.get()]
-        serial = self.selected_serial()
-        if require_device and serial:
-            base += ["-s", serial]
-        return base + args
+    def adb_base_cmd(self) -> list[str]:
+        adb = self.adb_path.get().strip() or "adb"
+        serial = self.get_serial_only()
+        cmd = [adb]
+        if serial:
+            cmd += ["-s", serial]
+        return cmd
 
-    def run_capture(self, args: list[str], require_device: bool = True, timeout: int | None = 20) -> str:
-        cmd = self.adb_cmd(args, require_device=require_device)
-        result = subprocess.run(
-            cmd,
+    def run_adb_capture(self, args: list[str], timeout: int = 10) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            self.adb_base_cmd() + args,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             creationflags=CREATE_NO_WINDOW,
-            timeout=timeout
+            timeout=timeout,
         )
-        if result.returncode != 0:
-            raise RuntimeError((result.stderr or result.stdout or "ADB command failed").strip())
-        return result.stdout
 
-    def refresh_devices(self):
+    def clear_device_connection_cache(self):
+        """
+        安全側の接続キャッシュクリア。
+        Windows OSのドライバ/デバイス履歴は削除せず、アプリ上の端末リストとADBサーバー状態だけをリセットする。
+        """
+        adb = self.adb_path.get().strip() or "adb"
+
+        self.selected_device.set("")
+        self.device_combo["values"] = []
+
+        messages = ["アプリ上の端末選択リストをクリアしました。"]
+
         try:
-            out = self.run_capture(["devices", "-l"], require_device=False)
-        except FileNotFoundError:
-            messagebox.showerror("ADBエラー", "adb.exe が見つかりません。platform-toolsを配置するか、adb.exeを参照してください。")
-            return
+            result = subprocess.run(
+                [adb, "kill-server"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+                timeout=10,
+            )
+
+            if result.returncode == 0:
+                messages.append("adb kill-server を実行しました。")
+            else:
+                messages.append("adb kill-server が失敗しました。")
+                if result.stderr or result.stdout:
+                    messages.append((result.stderr or result.stdout).strip())
+
+        except Exception as e:
+            messages.append(f"adb kill-server 実行時にエラー: {e}")
+
+        self.command_status.set("ADB接続キャッシュをクリアしました。")
+        self.browser_status.set("ADB接続キャッシュをクリアしました。必要に応じて端末検出を再実行してください。")
+        self.generate_command()
+
+        messagebox.showinfo(
+            "ADB接続キャッシュクリア",
+            "\n".join(messages) + "\n\n必要に応じてUSBを抜き差ししてから、端末検出を再実行してください。"
+        )
+
+    def detect_devices(self):
+        adb = self.adb_path.get().strip() or "adb"
+
+        try:
+            result = subprocess.run(
+                [adb, "devices", "-l"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+                timeout=10,
+            )
         except Exception as e:
             messagebox.showerror("ADBエラー", str(e))
             return
 
+        if result.returncode != 0:
+            messagebox.showerror("ADBエラー", result.stderr or result.stdout or "adb devices failed")
+            return
+
         devices = []
-        for line in out.splitlines()[1:]:
+        for line in result.stdout.splitlines()[1:]:
             line = line.strip()
             if not line:
                 continue
+
             parts = line.split()
-            if len(parts) >= 2:
-                serial = parts[0]
-                status = parts[1]
-                details = " ".join(parts[2:])
-                devices.append(f"{serial} {status} {details}".strip())
+            if len(parts) < 2:
+                continue
+
+            serial = parts[0]
+            state = parts[1]
+            details = " ".join(parts[2:])
+            devices.append(f"{serial} {state} {details}".strip())
 
         self.device_combo["values"] = devices
 
         if devices:
             self.selected_device.set(devices[0])
-            self.log_write("[INFO] 端末を検出しました。\n")
-            self.on_device_changed()
+            self.generate_command()
         else:
-            self.selected_device.set("")
-            self.storage_combo["values"] = []
-            self.selected_storage.set("")
-            self.log_write("[WARN] 接続端末が見つかりません。USBデバッグ許可を確認してください。\n")
+            messagebox.showwarning("未検出", "接続端末が見つかりません。USBデバッグ許可を確認してください。")
 
-    def on_device_changed(self):
-        self.refresh_android_roots()
-
-    def restart_adb(self):
-        if self.running:
-            messagebox.showwarning("実行中", "転送中はADBを再起動できません。")
-            return
-        try:
-            self.log_write("\n[INFO] adb kill-server\n")
-            self.run_capture(["kill-server"], require_device=False)
-            self.log_write("[INFO] adb start-server\n")
-            self.run_capture(["start-server"], require_device=False)
-            self.refresh_devices()
-        except Exception as e:
-            messagebox.showerror("ADBエラー", str(e))
-
-    # -----------------------------
-    # Storage roots
-    # -----------------------------
-    def refresh_android_roots(self):
-        serial = self.selected_serial()
-        if not serial:
-            return
-
-        roots: list[tuple[str, str]] = [
-            ("内部ストレージ /sdcard", "/sdcard/"),
-            ("内部ストレージ /storage/emulated/0", "/storage/emulated/0/"),
+    def detect_storage_roots(self):
+        """
+        ストレージ候補は毎回クリアして再生成する。
+        候補キャッシュが増え続けるのを防ぐ。
+        """
+        candidates = [
+            "/sdcard/Download/",
+            "/sdcard/ROMs/",
+            "/storage/emulated/0/Download/",
+            "/storage/emulated/0/ROMs/",
         ]
 
         try:
-            out = self.run_capture(["shell", "ls", "-1", "/storage"])
-            for name in out.splitlines():
-                name = name.strip()
-                if not name or name in {"emulated", "self"}:
+            result = self.run_adb_capture(["shell", "ls", "-1", "/storage"], timeout=10)
+        except Exception as e:
+            messagebox.showerror("ADBエラー", str(e))
+            return
+
+        if result.returncode != 0:
+            messagebox.showerror("ADBエラー", result.stderr or result.stdout or "storage detect failed")
+            return
+
+        for name in result.stdout.splitlines():
+            name = name.strip()
+            if not name or name in {"emulated", "self"}:
+                continue
+            candidates.append(f"/storage/{name}/")
+            candidates.append(f"/storage/{name}/ROMs/")
+            candidates.append(f"/storage/{name}/ROMs/ps2/")
+
+        clean = []
+        for item in candidates:
+            item = normalize_remote_dir(item)
+            if item not in clean:
+                clean.append(item)
+
+        self.remote_history = clean[:20]
+        self.remote_combo["values"] = self.remote_history
+
+        if self.remote_history:
+            self.remote_dir.set(self.remote_history[0])
+            self.browser_current_dir.set(self.remote_history[0])
+            self.load_android_dir(self.remote_history[0])
+
+        self.save_settings()
+        self.generate_command()
+        self.browser_status.set(f"ストレージ候補を再生成しました: {len(self.remote_history)}件")
+
+    def get_serial_only(self) -> str:
+        value = self.selected_device.get().strip()
+        if not value:
+            return ""
+        return value.split()[0]
+
+    # -----------------------------
+    # Remote dir
+    # -----------------------------
+    def set_remote_dir(self, value: str, save: bool = False):
+        remote = normalize_remote_dir(value)
+        self.remote_dir.set(remote)
+        self.browser_current_dir.set(remote)
+        if save:
+            self.save_current_remote()
+        else:
+            self.save_settings()
+            self.generate_command()
+
+    def on_remote_changed(self):
+        remote = normalize_remote_dir(self.remote_dir.get())
+        self.remote_dir.set(remote)
+        self.browser_current_dir.set(remote)
+        self.save_settings()
+        self.generate_command()
+
+    def on_remote_key_changed(self):
+        self.generate_command()
+
+    def save_current_remote(self):
+        current = normalize_remote_dir(self.remote_dir.get())
+        self.remote_dir.set(current)
+
+        self.remote_history = [current] + [x for x in self.remote_history if x != current]
+        self.remote_history = self.remote_history[:20]
+        self.remote_combo["values"] = self.remote_history
+
+        self.save_settings()
+        self.generate_command()
+
+    def clear_remote_history(self):
+        self.remote_history = []
+        self.remote_combo["values"] = []
+        self.save_settings()
+        self.generate_command()
+        self.browser_status.set("Android側ディレクトリ候補履歴をクリアしました。")
+
+    # -----------------------------
+    # Android browser
+    # -----------------------------
+    def list_android_dir(self, path: str) -> list[AndroidEntry]:
+        path = normalize_remote_dir(path)
+        qpath = quote_android_shell_path(path)
+
+        # -p でディレクトリ末尾に / を付ける。statは取らないので軽い。
+        result = self.run_adb_capture(["shell", f"ls -1Ap {qpath}"], timeout=15)
+
+        if result.returncode != 0:
+            # Android環境によって -A や -p が怪しい場合のフォールバック
+            result = self.run_adb_capture(["shell", f"ls -1 {qpath}"], timeout=15)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr or result.stdout or "ls failed")
+
+            entries = []
+            for line in result.stdout.splitlines():
+                name = line.strip()
+                if not name or name in {".", ".."}:
                     continue
 
-                remote_path = f"/storage/{name}/"
-                # 代表的なmicroSDは 1234-5678 のようなUUID形式。
-                roots.append((f"外部ストレージ候補 {remote_path}", remote_path))
+                full_path = path + name
+                qfull = quote_android_shell_path(full_path)
+                check = self.run_adb_capture(["shell", f"[ -d {qfull} ] && echo DIR || echo FILE"], timeout=3)
+                is_dir = check.stdout.strip() == "DIR"
 
-        except Exception as e:
-            self.log_write(f"[WARN] 外部ストレージ検出失敗: {e}\n")
+                entries.append(AndroidEntry(
+                    name=name,
+                    path=full_path + "/" if is_dir and not full_path.endswith("/") else full_path,
+                    is_dir=is_dir
+                ))
 
-        self.android_roots = dict(roots)
-        labels = list(self.android_roots.keys())
-        self.storage_combo["values"] = labels
+            return entries
 
-        if labels:
-            self.selected_storage.set(labels[0])
-            self.android_current_path.set(self.android_roots[labels[0]])
-            self.load_android_dir(self.android_roots[labels[0]])
-
-    def on_storage_changed(self):
-        label = self.selected_storage.get()
-        path = self.android_roots.get(label)
-        if path:
-            self.load_android_dir(path)
-
-    # -----------------------------
-    # Windows explorer
-    # -----------------------------
-    def load_local_dir(self, path: Path):
-        try:
-            path = path.expanduser().resolve()
-        except Exception:
-            messagebox.showwarning("パスエラー", "Windows側パスが不正です。")
-            return
-
-        if not path.exists() or not path.is_dir():
-            messagebox.showwarning("パスエラー", "Windows側のフォルダが存在しません。")
-            return
-
-        self.local_current_path.set(str(path))
-        self.local_selected_path.set("")
-        self.local_tree.delete(*self.local_tree.get_children())
-
-        parent = path.parent
-        if parent != path:
-            try:
-                stat = parent.stat()
-                modified = format_datetime_from_timestamp(stat.st_mtime)
-            except Exception:
-                modified = ""
-            self.local_tree.insert("", "end", text="📁 ..", values=(str(parent), "DIR", modified, ""))
-
-        # ドライブ一覧をルートに近いところで出す
-        if os.name == "nt":
-            for drive in self.list_windows_drives():
-                if Path(drive) != path:
-                    self.local_tree.insert("", "end", text=f"💽 {drive}", values=(drive, "DIR", "", ""))
-
-        try:
-            items = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-        except PermissionError:
-            messagebox.showwarning("権限エラー", "このフォルダを開けません。")
-            return
-        except Exception as e:
-            messagebox.showerror("エラー", str(e))
-            return
-
-        for item in items:
-            try:
-                stat = item.stat()
-                modified = format_datetime_from_timestamp(stat.st_mtime)
-                size = "" if item.is_dir() else format_bytes(stat.st_size)
-            except Exception:
-                modified = ""
-                size = ""
-
-            icon = "📁" if item.is_dir() else "📄"
-            kind = "DIR" if item.is_dir() else "FILE"
-            self.local_tree.insert("", "end", text=f"{icon} {item.name}", values=(str(item), kind, modified, size))
-
-    def list_windows_drives(self) -> list[str]:
-        drives = []
-        bitmask = 0
-        if os.name == "nt":
-            try:
-                import ctypes
-                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-            except Exception:
-                bitmask = 0
-
-        for letter in string.ascii_uppercase:
-            if bitmask & 1:
-                drives.append(f"{letter}:\\")
-            bitmask >>= 1
-        return drives
-
-    def goto_desktop(self):
-        path = Path.home() / "Desktop"
-        if not path.exists():
-            messagebox.showwarning("パスエラー", "デスクトップフォルダが見つかりません。")
-            return
-        self.load_local_dir(path)
-
-    def goto_downloads(self):
-        path = Path.home() / "Downloads"
-        if not path.exists():
-            messagebox.showwarning("パスエラー", "ダウンロードフォルダが見つかりません。")
-            return
-        self.load_local_dir(path)
-
-    def create_local_folder(self):
-        base_path = Path(self.local_current_path.get())
-        if not base_path.exists() or not base_path.is_dir():
-            messagebox.showwarning("パスエラー", "Windows側の現在フォルダが不正です。")
-            return
-
-        name = simpledialog.askstring("新しいフォルダ", "Windows側に作成するフォルダ名:")
-        if not name:
-            return
-
-        name = name.strip()
-        if not name:
-            return
-
-        invalid_chars = '<>:"/\\|?*'
-        if any(ch in name for ch in invalid_chars):
-            messagebox.showwarning("名前エラー", f"Windowsで使用できない文字が含まれています: {invalid_chars}")
-            return
-
-        new_path = base_path / name
-        try:
-            new_path.mkdir(exist_ok=False)
-            self.log_write(f"[INFO] Windows側フォルダ作成: {new_path}\n")
-            self.load_local_dir(base_path)
-        except FileExistsError:
-            messagebox.showwarning("作成失敗", "同名のフォルダまたはファイルが既に存在します。")
-        except Exception as e:
-            messagebox.showerror("作成失敗", str(e))
-
-    def on_local_select(self, _event=None):
-        item_id = self.local_tree.focus()
-        if not item_id:
-            return
-        values = self.local_tree.item(item_id, "values")
-        if values:
-            self.local_selected_path.set(values[0])
-
-    def on_local_double_click(self, _event=None):
-        item_id = self.local_tree.focus()
-        if not item_id:
-            return
-        values = self.local_tree.item(item_id, "values")
-        if len(values) >= 2 and values[1] == "DIR":
-            self.load_local_dir(Path(values[0]))
-
-    # -----------------------------
-    # Android explorer
-    # -----------------------------
-    def android_stat_info(self, path: str) -> tuple[int | None, str]:
-        qpath = quote_shell_path(path)
-        try:
-            out = self.run_capture(["shell", f"stat -c '%s|%Y' {qpath}"], timeout=3).strip()
-            if "|" not in out:
-                return None, ""
-            size_text, mtime_text = out.split("|", 1)
-            size = int(size_text.strip())
-            modified = format_datetime_from_timestamp(float(mtime_text.strip()))
-            return size, modified
-        except Exception:
-            return None, ""
-
-    def list_android_dir(self, path: str) -> list[AndroidItem]:
-        path = normalize_android_dir(path)
-        qpath = quote_shell_path(path)
-
-        # toybox/statの有無やOEM差を避けるため、まずlsで名前だけ取り、各項目をtest -dで判定。
-        out = self.run_capture(["shell", f"ls -1 {qpath}"], timeout=20)
-        items: list[AndroidItem] = []
-
-        for raw_name in out.splitlines():
-            name = raw_name.strip()
+        entries = []
+        for line in result.stdout.splitlines():
+            name = line.strip()
             if not name or name in {".", ".."}:
                 continue
 
-            full_path = path + name
-            qfull = quote_shell_path(full_path)
-            try:
-                kind = self.run_capture(["shell", f"[ -d {qfull} ] && echo DIR || echo FILE"], timeout=3).strip()
-            except Exception:
-                kind = "FILE"
+            is_dir = name.endswith("/")
+            display_name = name.rstrip("/")
+            full_path = path + display_name
 
-            is_dir = kind == "DIR"
-            size, modified = self.android_stat_info(full_path)
-            items.append(AndroidItem(
-                name=name,
-                path=full_path,
-                is_dir=is_dir,
-                size=None if is_dir else size,
-                modified=modified
+            entries.append(AndroidEntry(
+                name=display_name,
+                path=full_path + "/" if is_dir else full_path,
+                is_dir=is_dir
             ))
 
-        return items
+        return entries
 
     def load_android_dir(self, path: str):
-        """
-        Android側ディレクトリの読み込み。
-        microSDや大量ファイルのフォルダでGUIが固まらないよう、実処理は別スレッドで実行する。
-        """
-        serial = self.selected_serial()
-        if not serial:
-            self.log_write("[WARN] 端末が選択されていません。\n")
-            return
-
         if self.android_loading:
-            self.log_write("[INFO] Android側ディレクトリを読み込み中です。\n")
+            self.browser_status.set("Android側ファイラー: 読込中です。")
             return
 
-        path = normalize_android_dir(path)
+        path = normalize_remote_dir(path)
         self.android_loading = True
-        self.android_current_path.set(path)
-        self.android_selected_path.set("")
+        self.browser_current_dir.set(path)
         self.android_tree.delete(*self.android_tree.get_children())
-        self.android_tree.insert("", "end", text="読み込み中...", values=(path, "", "", ""))
-        self.log_write(f"[INFO] Android側ディレクトリ読込開始: {path}\n")
+        self.android_tree.insert("", "end", text="読み込み中...", values=(path, "", ""))
+        self.browser_status.set(f"Android側ファイラー: 読込中 {path}")
 
         def worker():
             try:
-                items = self.list_android_dir(path)
-                self.after(0, self.apply_android_dir_items, path, items, None)
+                entries = self.list_android_dir(path)
+                self.after(0, self.apply_android_entries, path, entries, None)
             except Exception as e:
-                self.after(0, self.apply_android_dir_items, path, [], e)
+                self.after(0, self.apply_android_entries, path, [], e)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def apply_android_dir_items(self, path: str, items: list[AndroidItem], error: Exception | None):
+    def apply_android_entries(self, path: str, entries: list[AndroidEntry], error: Exception | None):
         self.android_tree.delete(*self.android_tree.get_children())
 
         if error is not None:
             self.android_loading = False
-            self.log_write(f"[ERROR] Android側ディレクトリ取得失敗: {error}\n")
+            self.browser_status.set(f"Android側ファイラー: 読込失敗 {error}")
             return
 
         if path not in {"/", "/sdcard/", "/storage/emulated/0/"}:
             parent = str(PurePosixPath(path.rstrip("/")).parent)
             if not parent.endswith("/"):
                 parent += "/"
-            self.android_tree.insert("", "end", text="📁 ..", values=(parent, "DIR", "", ""))
+            self.android_tree.insert("", "end", text="📁 ..", values=(parent, "DIR"))
 
-        for item in sorted(items, key=lambda x: (not x.is_dir, x.name.lower())):
-            icon = "📁" if item.is_dir else "📄"
-            kind = "DIR" if item.is_dir else "FILE"
-            display_path = item.path + "/" if item.is_dir and not item.path.endswith("/") else item.path
-            size = "" if item.is_dir else format_bytes(item.size)
+        for entry in sorted(entries, key=lambda x: (not x.is_dir, x.name.lower())):
+            icon = "📁" if entry.is_dir else "📄"
+            kind = "DIR" if entry.is_dir else "FILE"
             self.android_tree.insert(
                 "",
                 "end",
-                text=f"{icon} {item.name}",
-                values=(display_path, kind, item.modified, size)
+                text=f"{icon} {entry.name}",
+                values=(entry.path, kind)
             )
 
         self.android_loading = False
-        self.log_write(f"[INFO] Android側ディレクトリ読込完了: {path} ({len(items)} items)\n")
+        self.browser_status.set(f"Android側ファイラー: 読込完了 {path} / {len(entries)}件")
 
     def on_android_select(self, _event=None):
         item_id = self.android_tree.focus()
         if not item_id:
             return
+
         values = self.android_tree.item(item_id, "values")
-        if values:
-            self.android_selected_path.set(values[0])
+        if len(values) >= 2 and values[1] == "DIR":
+            self.remote_dir.set(normalize_remote_dir(values[0]))
+            self.generate_command()
 
     def on_android_double_click(self, _event=None):
         item_id = self.android_tree.focus()
         if not item_id:
             return
+
         values = self.android_tree.item(item_id, "values")
         if len(values) >= 2 and values[1] == "DIR":
             self.load_android_dir(values[0])
 
-    def create_android_folder(self):
-        serial = self.selected_serial()
-        if not serial:
-            messagebox.showwarning("未選択", "端末を選択してください。")
-            return
+    def open_android_parent(self):
+        current = normalize_remote_dir(self.browser_current_dir.get())
+        parent = str(PurePosixPath(current.rstrip("/")).parent)
+        if not parent.endswith("/"):
+            parent += "/"
+        self.load_android_dir(parent)
 
-        base_path = normalize_android_dir(self.android_current_path.get())
-        name = simpledialog.askstring("新しいフォルダ", "Android側に作成するフォルダ名:")
-        if not name:
-            return
+    def use_browser_dir_as_remote(self):
+        self.set_remote_dir(self.browser_current_dir.get(), save=False)
+        self.command_status.set("保存先ディレクトリを現在の場所に設定しました。")
 
-        name = name.strip().strip("/")
-        if not name:
-            return
-
-        if "/" in name:
-            messagebox.showwarning("名前エラー", "フォルダ名に / は使用できません。")
-            return
-
-        new_path = base_path + name
-        qpath = quote_shell_path(new_path)
-
-        try:
-            self.run_capture(["shell", f"mkdir {qpath}"])
-            self.log_write(f"[INFO] Android側フォルダ作成: {new_path}\n")
-            self.load_android_dir(base_path)
-        except Exception as e:
-            messagebox.showerror("作成失敗", str(e))
-
-    # -----------------------------
-    # Progress
-    # -----------------------------
-    def reset_progress(self):
-        self.progress_bar.stop()
-        self.progress_bar.configure(mode="determinate")
-        self.progress_var.set(0)
-        self.progress_text.set("待機中")
-        self.progress_mode_known = False
-
-    def start_unknown_progress(self):
-        self.progress_mode_known = False
-        self.progress_var.set(0)
-        self.progress_bar.configure(mode="indeterminate")
-        self.progress_bar.start(10)
-        self.progress_text.set("転送中... 進捗率取得中")
-
-    def set_progress_percent(self, percent: int):
-        percent = max(0, min(100, percent))
-
-        if not self.progress_mode_known:
-            self.progress_bar.stop()
-            self.progress_bar.configure(mode="determinate")
-            self.progress_mode_known = True
-
-        self.progress_var.set(percent)
-        self.progress_text.set(f"{percent}% 転送中...")
-
-    def complete_progress(self):
-        self.progress_bar.stop()
-        self.progress_bar.configure(mode="determinate")
-        self.progress_var.set(100)
-        self.progress_text.set("100% 完了")
-
-    def fail_progress(self):
-        self.progress_bar.stop()
-        self.progress_bar.configure(mode="determinate")
-        self.progress_text.set("失敗")
-
-    def parse_progress_from_text(self, text: str) -> int | None:
-        matches = self.PROGRESS_RE.findall(text)
-        if not matches:
-            return None
-
-        try:
-            percent = int(matches[-1])
-        except ValueError:
-            return None
-
-        if 0 <= percent <= 100:
-            return percent
-        return None
-
-    # -----------------------------
-    # Transfer
-    # -----------------------------
-    def selected_android_destination_dir(self) -> str:
-        selected = self.android_selected_path.get().strip()
+    def use_selected_android_dir_as_remote(self):
         item_id = self.android_tree.focus()
-
-        if item_id:
-            values = self.android_tree.item(item_id, "values")
-            if len(values) >= 2 and values[1] == "DIR":
-                return normalize_android_dir(values[0])
-
-        return normalize_android_dir(self.android_current_path.get())
-
-    def selected_local_destination_dir(self) -> str:
-        selected = self.local_selected_path.get().strip()
-        if selected and Path(selected).exists() and Path(selected).is_dir():
-            return selected
-        return self.local_current_path.get().strip()
-
-    def push_selected(self):
-        if self.running:
-            messagebox.showwarning("実行中", "転送中です。")
+        if not item_id:
+            self.use_browser_dir_as_remote()
             return
 
-        serial = self.selected_serial()
-        local = self.local_selected_path.get().strip()
-        remote_dir = self.selected_android_destination_dir()
+        values = self.android_tree.item(item_id, "values")
+        if len(values) >= 2 and values[1] == "DIR":
+            self.set_remote_dir(values[0], save=False)
+            self.command_status.set("保存先ディレクトリを選択フォルダに設定しました。")
+        else:
+            self.use_browser_dir_as_remote()
 
-        if not serial:
-            messagebox.showwarning("未選択", "端末を選択してください。")
+    # -----------------------------
+    # Command generation
+    # -----------------------------
+    def generate_command(self):
+        self.save_settings()
+
+        script = self.build_powershell_script()
+
+        self.command_text.delete("1.0", "end")
+        self.command_text.insert("1.0", script)
+
+        now = datetime.now().strftime("%H:%M:%S")
+        self.command_status.set(f"コマンド生成済み {now} / {len(self.local_files)}ファイル")
+
+    def build_powershell_script(self) -> str:
+        adb = self.adb_path.get().strip() or "adb"
+        serial = self.get_serial_only()
+        remote_dir = normalize_remote_dir(self.remote_dir.get())
+        stop_on_error = "$true" if self.stop_on_error.get() else "$false"
+
+        lines = [
+            "# Generated by ADB Command Builder",
+            f"# Version: {APP_VERSION}",
+            "",
+            "$ErrorActionPreference = \"Continue\"",
+            f"$adb = {ps_single_quote(adb)}",
+            f"$serial = {ps_single_quote(serial)}",
+            f"$stopOnError = {stop_on_error}",
+            "",
+            "function Invoke-Adb {",
+            "    param([string[]]$Arguments)",
+            "",
+            "    if ([string]::IsNullOrWhiteSpace($serial)) {",
+            "        & $adb @Arguments",
+            "    } else {",
+            "        & $adb -s $serial @Arguments",
+            "    }",
+            "}",
+            "",
+            "function Quote-AndroidPath {",
+            "    param([string]$Path)",
+            "    return \"'\" + ($Path -replace \"'\", \"'\\''\") + \"'\"",
+            "}",
+            "",
+            "$items = @(",
+        ]
+
+        if not self.local_files:
+            lines += [
+                "    # ここに転送対象がありません。",
+                "    # GUIでファイルをD&D、または [ファイル追加] から選択してください。",
+            ]
+        else:
+            for idx, local in enumerate(self.local_files, start=1):
+                file_name = Path(local).name
+                final_remote = remote_join(remote_dir, file_name)
+
+                rename = False
+                temp_remote = final_remote
+
+                if self.preserve_filename.get() and not file_name.isascii():
+                    temp_name = make_safe_temp_filename(file_name, idx)
+                    temp_remote = remote_join(remote_dir, temp_name)
+                    rename = True
+
+                rename_text = "$true" if rename else "$false"
+
+                lines += [
+                    "    [pscustomobject]@{",
+                    f"        Local = {ps_single_quote(local)}",
+                    f"        TempRemote = {ps_single_quote(temp_remote)}",
+                    f"        FinalRemote = {ps_single_quote(final_remote)}",
+                    f"        Rename = {rename_text}",
+                    "    }",
+                ]
+
+        lines += [
+            ")",
+            "",
+            "foreach ($item in $items) {",
+            "    Write-Host \"\"",
+            "    Write-Host \"Push: $($item.Local)\"",
+            "    Write-Host \"  -> $($item.TempRemote)\"",
+            "",
+            "    Invoke-Adb @(\"push\", $item.Local, $item.TempRemote)",
+            "",
+            "    if ($LASTEXITCODE -ne 0) {",
+            "        Write-Warning \"Push failed: $($item.Local)\"",
+            "        if ($stopOnError) { exit $LASTEXITCODE }",
+            "        continue",
+            "    }",
+            "",
+            "    if ($item.Rename) {",
+            "        $src = Quote-AndroidPath $item.TempRemote",
+            "        $dst = Quote-AndroidPath $item.FinalRemote",
+            "        Write-Host \"Rename: $($item.TempRemote) -> $($item.FinalRemote)\"",
+            "        Invoke-Adb @(\"shell\", \"mv -f $src $dst\")",
+            "",
+            "        if ($LASTEXITCODE -ne 0) {",
+            "            Write-Warning \"Rename failed. Temporary file remains: $($item.TempRemote)\"",
+            "            if ($stopOnError) { exit $LASTEXITCODE }",
+            "        }",
+            "    }",
+            "}",
+            "",
+            "Write-Host \"\"",
+            "Write-Host \"Done.\"",
+        ]
+
+        return "\n".join(lines)
+
+    def default_ps1_filename(self) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        if not self.local_files:
+            return f"adb_push_{timestamp}.ps1"
+
+        first = Path(self.local_files[0])
+        stem = sanitize_windows_filename(first.stem, fallback="adb_push")
+
+        if len(self.local_files) == 1:
+            return f"adb_push_{stem}.ps1"
+
+        return f"adb_push_{stem}_and_{len(self.local_files) - 1}_more.ps1"
+
+    def default_ps1_initial_dir(self) -> str:
+        if self.local_files:
+            parent = Path(self.local_files[0]).parent
+            if parent.exists():
+                return str(parent)
+        return str(Path.home())
+
+    def copy_command(self):
+        script = self.command_text.get("1.0", "end").strip()
+        if not script:
             return
 
-        if not local or not Path(local).exists():
-            messagebox.showwarning("未選択", "Windows側のコピー元ファイル/フォルダを選択してください。")
+        self.clipboard_clear()
+        self.clipboard_append(script)
+        self.update()
+
+        now = datetime.now().strftime("%H:%M:%S")
+        self.command_status.set(f"クリップボードへコピー済み {now}")
+        messagebox.showinfo("コピー完了", "PowerShellコマンドをクリップボードへコピーしました。")
+
+    def save_ps1(self):
+        path = filedialog.asksaveasfilename(
+            title="PowerShellスクリプトとして保存",
+            initialdir=self.default_ps1_initial_dir(),
+            initialfile=self.default_ps1_filename(),
+            defaultextension=".ps1",
+            filetypes=[
+                ("PowerShell script", "*.ps1"),
+                ("All files", "*.*"),
+            ]
+        )
+
+        if not path:
             return
 
-        cmd = self.adb_cmd(["push", local, remote_dir])
-        self.run_adb_async(cmd, on_success=lambda: self.load_android_dir(self.android_current_path.get()))
+        script = self.command_text.get("1.0", "end").strip() + "\n"
+        Path(path).write_text(script, encoding="utf-8-sig")
 
-    def pull_selected(self):
-        if self.running:
-            messagebox.showwarning("実行中", "転送中です。")
-            return
-
-        serial = self.selected_serial()
-        remote = self.android_selected_path.get().strip()
-        local_dir = self.selected_local_destination_dir()
-
-        if not serial:
-            messagebox.showwarning("未選択", "端末を選択してください。")
-            return
-
-        if not remote:
-            messagebox.showwarning("未選択", "Android側のコピー元ファイル/フォルダを選択してください。")
-            return
-
-        if not local_dir or not Path(local_dir).exists() or not Path(local_dir).is_dir():
-            messagebox.showwarning("未選択", "Windows側のコピー先フォルダを選択してください。")
-            return
-
-        cmd = self.adb_cmd(["pull", remote, local_dir])
-        self.run_adb_async(cmd, on_success=lambda: self.load_local_dir(Path(self.local_current_path.get())))
-
-    def run_adb_async(self, cmd: list[str], on_success=None):
-        if self.running:
-            messagebox.showwarning("実行中", "ADBコマンドを実行中です。")
-            return
-
-        self.running = True
-        self.reset_progress()
-        self.start_unknown_progress()
-
-        display_cmd = " ".join(f'"{c}"' if " " in c else c for c in cmd)
-        self.log_write("\n$ " + display_cmd + "\n")
-
-        def worker():
-            last_percent = None
-            buffer = ""
-
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    bufsize=0,
-                    creationflags=CREATE_NO_WINDOW
-                )
-
-                assert proc.stdout is not None
-
-                while True:
-                    chunk = proc.stdout.read(1)
-                    if not chunk:
-                        break
-
-                    char = chunk.decode("utf-8", errors="replace")
-                    buffer += char
-
-                    if char in ("\r", "\n"):
-                        text = buffer.strip()
-                        if text:
-                            percent = self.parse_progress_from_text(text)
-                            if percent is not None and percent != last_percent:
-                                last_percent = percent
-                                self.after(0, self.set_progress_percent, percent)
-                            self.after(0, self.log_write, text + "\n")
-                        buffer = ""
-                    else:
-                        percent = self.parse_progress_from_text(buffer[-160:])
-                        if percent is not None and percent != last_percent:
-                            last_percent = percent
-                            self.after(0, self.set_progress_percent, percent)
-
-                if buffer.strip():
-                    text = buffer.strip()
-                    percent = self.parse_progress_from_text(text)
-                    if percent is not None:
-                        self.after(0, self.set_progress_percent, percent)
-                    self.after(0, self.log_write, text + "\n")
-
-                code = proc.wait()
-                self.after(0, self.log_write, f"\n[EXIT CODE] {code}\n")
-
-                if code == 0:
-                    self.after(0, self.complete_progress)
-                    if on_success:
-                        self.after(0, on_success)
-                    self.after(0, messagebox.showinfo, "完了", "ADB転送が完了しました。")
-                else:
-                    self.after(0, self.fail_progress)
-                    self.after(0, messagebox.showerror, "エラー", f"ADBコマンドが失敗しました。終了コード: {code}")
-
-            except Exception as e:
-                self.after(0, self.fail_progress)
-                self.after(0, self.log_write, f"\n[ERROR] {e}\n")
-                self.after(0, messagebox.showerror, "エラー", str(e))
-            finally:
-                self.running = False
-
-        threading.Thread(target=worker, daemon=True).start()
+        now = datetime.now().strftime("%H:%M:%S")
+        self.command_status.set(f".ps1保存済み {now}: {Path(path).name}")
+        messagebox.showinfo("保存完了", f"保存しました:\n{path}")
 
 
 if __name__ == "__main__":
-    app = AdbFileTransferGui()
+    app = AdbCommandBuilder()
     app.mainloop()

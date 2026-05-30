@@ -13,7 +13,8 @@ pip install -r requirements.txt
 pyinstaller ^
   --noconsole ^
   --onefile ^
-  --name AdbFileTransfer ^
+  --name AdbCommandBuilder ^
+  --collect-all tkinterdnd2 ^
   --add-binary "platform-tools\adb.exe;platform-tools" ^
   --add-binary "platform-tools\AdbWinApi.dll;platform-tools" ^
   --add-binary "platform-tools\AdbWinUsbApi.dll;platform-tools" ^
@@ -21,5 +22,5 @@ pyinstaller ^
 
 echo.
 echo build complete.
-echo output: dist\AdbFileTransfer.exe
+echo output: dist\AdbCommandBuilder.exe
 pause
