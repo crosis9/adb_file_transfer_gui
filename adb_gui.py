@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 APP_TITLE = f"ADB File Transfer GUI v{APP_VERSION} | kuroha"
 
 CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -107,6 +107,7 @@ class AdbFileTransferGui(tk.Tk):
         self.progress_text = tk.StringVar(value="待機中")
         self.progress_mode_known = False
         self.running = False
+        self.android_loading = False
 
         self._build_ui()
         self.refresh_devices()
@@ -277,7 +278,7 @@ class AdbFileTransferGui(tk.Tk):
             base += ["-s", serial]
         return base + args
 
-    def run_capture(self, args: list[str], require_device: bool = True) -> str:
+    def run_capture(self, args: list[str], require_device: bool = True, timeout: int | None = 20) -> str:
         cmd = self.adb_cmd(args, require_device=require_device)
         result = subprocess.run(
             cmd,
@@ -285,7 +286,8 @@ class AdbFileTransferGui(tk.Tk):
             text=True,
             encoding="utf-8",
             errors="replace",
-            creationflags=CREATE_NO_WINDOW
+            creationflags=CREATE_NO_WINDOW,
+            timeout=timeout
         )
         if result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout or "ADB command failed").strip())
@@ -519,7 +521,7 @@ class AdbFileTransferGui(tk.Tk):
     def android_stat_info(self, path: str) -> tuple[int | None, str]:
         qpath = quote_shell_path(path)
         try:
-            out = self.run_capture(["shell", f"stat -c '%s|%Y' {qpath}"]).strip()
+            out = self.run_capture(["shell", f"stat -c '%s|%Y' {qpath}"], timeout=3).strip()
             if "|" not in out:
                 return None, ""
             size_text, mtime_text = out.split("|", 1)
@@ -534,7 +536,7 @@ class AdbFileTransferGui(tk.Tk):
         qpath = quote_shell_path(path)
 
         # toybox/statの有無やOEM差を避けるため、まずlsで名前だけ取り、各項目をtest -dで判定。
-        out = self.run_capture(["shell", f"ls -1 {qpath}"])
+        out = self.run_capture(["shell", f"ls -1 {qpath}"], timeout=20)
         items: list[AndroidItem] = []
 
         for raw_name in out.splitlines():
@@ -545,7 +547,7 @@ class AdbFileTransferGui(tk.Tk):
             full_path = path + name
             qfull = quote_shell_path(full_path)
             try:
-                kind = self.run_capture(["shell", f"[ -d {qfull} ] && echo DIR || echo FILE"]).strip()
+                kind = self.run_capture(["shell", f"[ -d {qfull} ] && echo DIR || echo FILE"], timeout=3).strip()
             except Exception:
                 kind = "FILE"
 
@@ -562,35 +564,64 @@ class AdbFileTransferGui(tk.Tk):
         return items
 
     def load_android_dir(self, path: str):
+        """
+        Android側ディレクトリの読み込み。
+        microSDや大量ファイルのフォルダでGUIが固まらないよう、実処理は別スレッドで実行する。
+        """
         serial = self.selected_serial()
         if not serial:
             self.log_write("[WARN] 端末が選択されていません。\n")
             return
 
+        if self.android_loading:
+            self.log_write("[INFO] Android側ディレクトリを読み込み中です。\n")
+            return
+
         path = normalize_android_dir(path)
+        self.android_loading = True
         self.android_current_path.set(path)
         self.android_selected_path.set("")
         self.android_tree.delete(*self.android_tree.get_children())
+        self.android_tree.insert("", "end", text="読み込み中...", values=(path, "", "", ""))
+        self.log_write(f"[INFO] Android側ディレクトリ読込開始: {path}\n")
 
-        # 親ディレクトリ
+        def worker():
+            try:
+                items = self.list_android_dir(path)
+                self.after(0, self.apply_android_dir_items, path, items, None)
+            except Exception as e:
+                self.after(0, self.apply_android_dir_items, path, [], e)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_android_dir_items(self, path: str, items: list[AndroidItem], error: Exception | None):
+        self.android_tree.delete(*self.android_tree.get_children())
+
+        if error is not None:
+            self.android_loading = False
+            self.log_write(f"[ERROR] Android側ディレクトリ取得失敗: {error}\n")
+            return
+
         if path not in {"/", "/sdcard/", "/storage/emulated/0/"}:
             parent = str(PurePosixPath(path.rstrip("/")).parent)
             if not parent.endswith("/"):
                 parent += "/"
             self.android_tree.insert("", "end", text="📁 ..", values=(parent, "DIR", "", ""))
 
-        try:
-            items = self.list_android_dir(path)
-        except Exception as e:
-            self.log_write(f"[ERROR] Android側ディレクトリ取得失敗: {e}\n")
-            return
-
         for item in sorted(items, key=lambda x: (not x.is_dir, x.name.lower())):
             icon = "📁" if item.is_dir else "📄"
             kind = "DIR" if item.is_dir else "FILE"
             display_path = item.path + "/" if item.is_dir and not item.path.endswith("/") else item.path
             size = "" if item.is_dir else format_bytes(item.size)
-            self.android_tree.insert("", "end", text=f"{icon} {item.name}", values=(display_path, kind, item.modified, size))
+            self.android_tree.insert(
+                "",
+                "end",
+                text=f"{icon} {item.name}",
+                values=(display_path, kind, item.modified, size)
+            )
+
+        self.android_loading = False
+        self.log_write(f"[INFO] Android側ディレクトリ読込完了: {path} ({len(items)} items)\n")
 
     def on_android_select(self, _event=None):
         item_id = self.android_tree.focus()
